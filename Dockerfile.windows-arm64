@@ -186,11 +186,13 @@ RUN sed -i 's/#if defined(_MSC_VER)/#if defined(_WIN32)/' src/node.cc \
           -e 's/#include <VersionHelpers\.h>/#include <versionhelpers.h>/g' \
           -e 's/#include <WinError\.h>/#include <winerror.h>/g'
 
-# Fix static_assert: on Windows ARM64 MinGW uses MSVC ABI (sizeof==48),
-# not Itanium ABI (sizeof==40).  V8_CC_MSVC only covers _MSC_VER, but
-# __aarch64__ on Windows also follows the MSVC struct layout.
+# Fix static_asserts: on Windows ARM64, MinGW uses the MSVC ABI for struct
+# layout, not the Itanium ABI.  V8_CC_MSVC only covers _MSC_VER, but
+# MinGW on Windows ARM64 also follows the MSVC struct layout conventions.
+# Apply the same MSVC vs non-MSVC branching to both HeapEntry and HeapGraphEdge.
 RUN sed -i \
-    's/#if V8_CC_MSVC/#if V8_CC_MSVC || (defined(_WIN32) \&\& defined(__aarch64__))/' \
+    -e 's/#if V8_CC_MSVC/#if V8_CC_MSVC || (defined(_WIN32) \&\& defined(__aarch64__))/' \
+    -e '/sizeof(HeapGraphEdge).*== 24/s/sizeof(HeapGraphEdge) == 24/sizeof(HeapGraphEdge) == 24 || sizeof(HeapGraphEdge) == 32/' \
     deps/v8/src/profiler/heap-snapshot-generator.cc
 
 RUN python3 configure.py \
