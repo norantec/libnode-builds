@@ -137,6 +137,14 @@ RUN sed -i \
     -e "s/\['OS==\"linux\" or OS==\"openharmony\"', {/\['OS==\"linux\" or OS==\"openharmony\" or _toolset==\"host\"', {/" \
     tools/v8_gypfiles/v8.gyp
 
+# Fix trap-handler for cross-compilation:
+# 1. Scope Windows trap-handler sources (handler-inside-win.cc) to target-only
+# 2. Give the host toolset POSIX trap-handler sources (handler-inside-posix.cc)
+RUN sed -i \
+    -e '1156s/OS in "linux mac ios freebsd openharmony"/OS in "linux mac ios freebsd openharmony" or _toolset=="host"/' \
+    -e '1162s/\['"'"'OS=="win"'"'"', {/\['"'"'OS=="win" and _toolset==\"target\"'"'"', {/' \
+    tools/v8_gypfiles/v8.gyp
+
 # Patch V8 export-template.h: Clang's preprocessor treats __declspec as
 # a keyword, which breaks V8's macro-based detection of __declspec(dllexport)
 # vs __attribute__.  When the detection fails it tries to expand an undefined
