@@ -46,7 +46,7 @@ jobs:
         run: |
           curl -L -o node.tar.gz https://github.com/nodejs/node/archive/refs/tags/v${{ matrix.node_version }}.tar.gz
           tar zxvf node.tar.gz
-          mv node-v${{ matrix.node_version }} source
+          mv node-${{ matrix.node_version }} source
 
       - name: Build cache
         run: |
