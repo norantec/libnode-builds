@@ -1,0 +1,8 @@
+{
+  "node_version": [
+    "24.16.0"
+  ],
+  "target": [
+    "windows-arm64"
+  ]
+}

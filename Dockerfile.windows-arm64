@@ -1,0 +1,196 @@
+FROM ubuntu:24.04
+
+# Install host build dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    make \
+    gcc \
+    g++ \
+    git \
+    curl \
+    xz-utils \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Zig toolchain (compiler + linker for cross-compilation)
+ARG ZIG_VERSION=0.13.0
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+      -o /tmp/zig.tar.xz \
+    && tar -xJf /tmp/zig.tar.xz -C /usr/local \
+    && mv /usr/local/zig-linux-x86_64-${ZIG_VERSION} /usr/local/zig \
+    && ln -s /usr/local/zig/zig /usr/local/bin/zig \
+    && rm /tmp/zig.tar.xz
+
+# Install full MinGW-w64 headers and libraries for ARM64 Windows from llvm-mingw.
+# Zig's bundled MinGW headers are minimal; llvm-mingw provides the complete
+# Windows SDK surface (windows.h, VersionHelpers.h, full Win32 API, etc.)
+ARG LLVM_MINGW_VER=20260616
+RUN curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VER}/llvm-mingw-${LLVM_MINGW_VER}-ucrt-ubuntu-22.04-x86_64.tar.xz" \
+      -o /tmp/llvm-mingw.tar.xz \
+    && tar -xJf /tmp/llvm-mingw.tar.xz -C /usr/local \
+    && mv /usr/local/llvm-mingw-${LLVM_MINGW_VER}-ucrt-ubuntu-22.04-x86_64 /usr/local/llvm-mingw \
+    && rm /tmp/llvm-mingw.tar.xz
+
+# Create wrapper scripts.  zig cc/zig c++ target Windows ARM64 via MinGW,
+# using llvm-mingw's complete headers and libraries (prepended so they
+# take priority over zig's bundled minimal MinGW headers).
+RUN echo '#!/bin/sh'           > /usr/local/bin/zig-cc \
+    && echo 'exec zig cc  -target aarch64-windows-gnu -isystem /usr/local/llvm-mingw/aarch64-w64-mingw32/include -L /usr/local/llvm-mingw/aarch64-w64-mingw32/lib "$@"' >> /usr/local/bin/zig-cc \
+    && chmod +x /usr/local/bin/zig-cc \
+    && echo '#!/bin/sh'        > /usr/local/bin/zig-cxx \
+    && echo 'exec zig c++ -target aarch64-windows-gnu -isystem /usr/local/llvm-mingw/aarch64-w64-mingw32/include -L /usr/local/llvm-mingw/aarch64-w64-mingw32/lib "$@"' >> /usr/local/bin/zig-cxx \
+    && chmod +x /usr/local/bin/zig-cxx \
+    && echo '#!/bin/sh'        > /usr/local/bin/zig-ar \
+    && echo 'exec zig ar  "$@"' >> /usr/local/bin/zig-ar \
+    && chmod +x /usr/local/bin/zig-ar \
+    && echo '#!/bin/sh'        > /usr/local/bin/zig-ranlib \
+    && echo 'exec zig ranlib "$@"' >> /usr/local/bin/zig-ranlib \
+    && chmod +x /usr/local/bin/zig-ranlib \
+    && echo '#!/bin/sh'        > /usr/local/bin/zig-nm \
+    && echo 'exec zig nm  "$@"' >> /usr/local/bin/zig-nm \
+    && chmod +x /usr/local/bin/zig-nm
+
+# Target compiler toolchain -> zig (Windows ARM64)
+# Host compiler toolchain -> system gcc/g++ (Linux x86_64, for mksnapshot etc.)
+ENV CC=zig-cc
+ENV CXX=zig-cxx
+ENV CC_host=gcc
+ENV CXX_host=g++
+ENV AR=zig-ar
+ENV RANLIB=zig-ranlib
+ENV NM=zig-nm
+ENV LD=zig-cc
+
+COPY source /build/node
+WORKDIR /build/node
+
+# Patch configure.py: when cross-compiling for Windows from Linux,
+# use the 'make-win' GYP generator instead of 'msvs'.
+RUN sed -i "s/elif flavor == 'win' and sys.platform != 'msys':/elif flavor == 'win' and sys.platform != 'msys' and not options.cross_compiling:/" \
+    configure.py
+
+# Patch uv.gyp so the host toolset (Linux) uses POSIX sources, not Windows sources.
+# GYP applies OS conditions to ALL toolsets; `_toolset` scopes them per-toolset.
+RUN sed -i \
+    -e 's/^        \[ '\''OS=="win"'\'', {/        [ '\''OS=="win" and _toolset=="target"'\'', {/' \
+    -e 's/^        \[ '\''OS in "linux mac ios android zos openharmony"'\'', {/        [ '\''OS in "linux mac ios android zos openharmony" or _toolset=="host"'\'', {/' \
+    -e 's/^        \[ '\''OS=="linux" or OS=="openharmony"'\'', {/        [ '\''OS=="linux" or OS=="openharmony" or _toolset=="host"'\'', {/' \
+    deps/uv/uv.gyp
+
+# Patch openssl_common.gypi: replace MSVC-style flags with MinGW-compatible ones
+# since zig cc uses GCC/Clang-style flags, not MSVC.
+RUN sed -i \
+    -e "s/'-W3', '-wd4090', '-Gs0', '-GF', '-Gy', '-nologo','\/O2'/'-O2'/" \
+    -e "s/'-lws2_32\.lib'/'-lws2_32'/" \
+    -e "s/'-lgdi32\.lib'/'-lgdi32'/" \
+    -e "s/'-ladvapi32\.lib'/'-ladvapi32'/" \
+    -e "s/'-lcrypt32\.lib'/'-lcrypt32'/" \
+    -e "s/'-luser32\.lib'/'-luser32'/" \
+    deps/openssl/openssl_common.gypi
+
+# Patch abseil-cpp: zig cc targeting aarch64-windows-gnu defines __MINGW32__
+# but does NOT bundle winpthreads, so absl must use C++11 thread_local and
+# std::mutex-based synchronization instead of pthreads.
+RUN sed -i \
+    's/#if !defined(_WIN32) || defined(__MINGW32__)/#if !defined(_WIN32) || (defined(__MINGW32__) \&\& __has_include(<pthread.h>))/' \
+    deps/v8/third_party/abseil-cpp/absl/base/internal/thread_identity.cc \
+    && sed -i \
+    's/#elif defined(_WIN32) \&\& !defined(__MINGW32__)/#elif defined(_WIN32) \&\& (!defined(__MINGW32__) || !__has_include(<pthread.h>))/' \
+    deps/v8/third_party/abseil-cpp/absl/base/internal/thread_identity.h
+
+# Patch common.gypi: the GCC/Clang C++20 flag (-std=gnu++20) is only set
+# for Linux/macOS/etc.  When using the 'make-win' generator (MinGW), we need
+# it applied for the Windows target as well.
+RUN sed -i \
+    's/"linux freebsd openbsd solaris android aix os400 cloudabi openharmony"/"linux freebsd openbsd solaris android aix os400 cloudabi openharmony win"/' \
+    common.gypi
+
+# Patch v8.gyp: when v8_libplatform is built for the host toolset (Linux),
+# Windows-specific ETW tracing sources must not be included (no windows.h).
+RUN sed -i \
+    "s/\['v8_enable_system_instrumentation==1 and is_win'/\['v8_enable_system_instrumentation==1 and is_win and _toolset==\"target\"'/" \
+    tools/v8_gypfiles/v8.gyp
+
+# Patch zlib cpu_features.c: when built for the host toolset on Linux,
+# windows.h is unavailable.  Use __has_include to skip it gracefully.
+RUN sed -i \
+    's/defined(ARMV8_OS_WINDOWS) || defined(X86_WINDOWS)/(defined(ARMV8_OS_WINDOWS) || defined(X86_WINDOWS)) \&\& __has_include(<windows.h>)/' \
+    deps/v8/third_party/zlib/cpu_features.c
+
+# Disable V8 system instrumentation and ETW stack walking for Windows.
+# zig's bundled MinGW does not include the Windows SDK headers
+# (TraceLoggingProvider.h etc.) required by these features.
+RUN sed -i \
+    -e 's/'\''OS == "win" or OS == "mac"'\''/'\''OS == "mac"'\''/' \
+    -e 's/'\''v8_enable_etw_stack_walking'\'': 1/'\''v8_enable_etw_stack_walking'\'': 0/' \
+    tools/v8_gypfiles/features.gypi
+
+# Patch v8.gyp: scope `is_win` and `OS=="win"` source selections to the
+# target toolset, and also provide POSIX/Linux sources for the host toolset.
+# Without these the host builds (mksnapshot etc.) fail because OS conditions
+# apply to all toolsets but the host is always Linux.
+RUN sed -i \
+    -e "s/\['is_win', {/\['is_win and _toolset==\"target\"', {/" \
+    -e "s/\['is_posix or is_fuchsia', {/\['is_posix or is_fuchsia or _toolset==\"host\"', {/" \
+    -e "s/\['OS==\"linux\" or OS==\"openharmony\"', {/\['OS==\"linux\" or OS==\"openharmony\" or _toolset==\"host\"', {/" \
+    tools/v8_gypfiles/v8.gyp
+
+# Patch V8 export-template.h: Clang's preprocessor treats __declspec as
+# a keyword, which breaks V8's macro-based detection of __declspec(dllexport)
+# vs __attribute__.  When the detection fails it tries to expand an undefined
+# macro (EXPORT_TEMPLATE_TEST_MSVC_HACK_DEFAULT), causing a syntax error.
+# Define the missing fallback macro so the sanity-check test compiles.
+RUN sed -i \
+    '/^#define EXPORT_TEMPLATE_TEST_MSVC_HACK_MSVC_HACK/a\#define EXPORT_TEMPLATE_TEST_MSVC_HACK_DEFAULT(...) true' \
+    deps/v8/src/base/export-template.h
+
+# Fix case-sensitive include for VersionHelpers.h.  Zig's MinGW headers use
+# lowercase filenames but V8 uses the Windows-typical MixedCase.
+RUN sed -i 's/#include <VersionHelpers.h>/#include <versionhelpers.h>/' \
+    deps/v8/src/base/platform/platform-win32.cc
+
+# Add UNICODE defines globally for Windows targets.  Without these, MinGW
+# headers resolve Windows API macros (GetModuleFileName etc.) to the ANSI
+# variants, but V8 passes wide-char strings expecting the W variants.
+RUN sed -i "/'NOMINMAX',/a\          'UNICODE',\n          '_UNICODE'," common.gypi
+
+# Fix platform-win32.cc for UCRT MinGW compatibility.
+# V8 provides localtime_s / _vsnprintf_s fallbacks for old MinGW,
+# but UCRT MinGW already has them —> delete V8's fallback implementations.
+RUN sed -i '87,91s/^/\/\//' deps/v8/src/base/platform/platform-win32.cc
+RUN sed -i '104,108s/^/\/\//' deps/v8/src/base/platform/platform-win32.cc
+
+# Guard CET (Control-flow Enforcement) code that uses Win10 APIs
+# not in MinGW headers.
+RUN sed -i '755,781s/^/\/\//' deps/v8/src/base/platform/platform-win32.cc \
+    && sed -i '819s/UserShadowStackEnabled()/false/' deps/v8/src/base/platform/platform-win32.cc
+
+# Fix case-sensitive Windows header includes.  The source uses MixedCase
+# (Windows.h, Lm.h, VersionHelpers.h, WinError.h) but MinGW on Linux
+# provides them in lowercase.
+# Several src/*.cc files use `#if defined(_MSC_VER)` as their Windows
+# include guard, putting POSIX headers (sys/resource.h etc.) in the #else.
+# MinGW is not MSVC but also targets Windows and lacks those POSIX headers.
+# Change the guard to `_WIN32` so MinGW takes the Windows path.
+RUN sed -i 's/#if defined(_MSC_VER)/#if defined(_WIN32)/' src/node.cc \
+    && sed -i 's/#if defined(_MSC_VER)/#if defined(_WIN32)/' src/node_process_methods.cc \
+    && sed -i '/typedef int mode_t;/d' src/node_process_methods.cc
+
+RUN grep -rl '#include <Windows\.h>\|#include <Lm\.h>\|#include <VersionHelpers\.h>\|#include <WinError\.h>' \
+      src deps --include='*.cc' --include='*.h' 2>/dev/null | \
+    xargs -r sed -i \
+    -e 's/#include <Windows\.h>/#include <windows.h>/g' \
+    -e 's/#include <Lm\.h>/#include <lm.h>/g' \
+    -e 's/#include <VersionHelpers\.h>/#include <versionhelpers.h>/g' \
+    -e 's/#include <WinError\.h>/#include <winerror.h>/g'
+
+RUN python3 configure.py \
+    --dest-cpu=arm64 \
+    --dest-os=win \
+    --cross-compiling \
+    --with-intl=none \
+    --without-node-snapshot \
+    --without-node-code-cache \
+    && make -j$(nproc)

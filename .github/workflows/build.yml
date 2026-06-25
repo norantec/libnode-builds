@@ -1,0 +1,55 @@
+name: Build Node.js
+
+on:
+  push:
+    branches:
+      - '*'
+      - '**'
+      - '*/*'
+
+permissions:
+  contents: write
+  discussions: write
+
+jobs:
+  load-matrix:
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.load.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: load
+        shell: bash
+        run: |
+          echo "matrix=$(jq -c . matrix.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: load-matrix
+
+    env:
+      ACTIONS_STEP_DEBUG: true
+
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.load-matrix.outputs.matrix) }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout actions
+        uses: actions/checkout@v4
+
+      - name: Prepare source code
+        run: |
+          curl -L -o node.tar.gz https://github.com/nodejs/node/archive/refs/tags/v${{ matrix.node_version }}.tar.gz
+          tar zxvf node.tar.gz
+          mv node-v${{ matrix.node_version }} source
+
+      - name: Build cache
+        run: |
+          docker build \
+            -t libnode:${{ matrix.node_version }}-${{ matrix.target }} \
+            -f Dockerfile.${{ matrix.target }} .
